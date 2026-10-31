@@ -5,6 +5,7 @@ import android.app.AlertDialog
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.res.ColorStateList
 import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Color
@@ -15,6 +16,7 @@ import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
 import android.os.SystemClock
+import android.view.Choreographer
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
@@ -26,17 +28,18 @@ import android.widget.TextView
 import java.util.ArrayDeque
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : Activity() {
     companion object { private const val ACTION_USB_PERMISSION = "io.driftlab.dualsense.USB_PERMISSION" }
     private enum class Session { NONE, CENTER, RANGE, FAULT }
-    private val background = Color.rgb(10, 16, 31)
-    private val surface = Color.rgb(23, 33, 55)
-    private val accent = Color.rgb(57, 169, 247)
-    private val ink = Color.rgb(238, 243, 252)
-    private val muted = Color.rgb(158, 171, 192)
-    private val good = Color.rgb(104, 235, 186)
-    private val warning = Color.rgb(255, 191, 105)
+    private val background = Color.rgb(245, 248, 253)
+    private val surface = Color.rgb(255, 255, 255)
+    private val accent = Color.rgb(19, 101, 232)
+    private val ink = Color.rgb(30, 47, 72)
+    private val muted = Color.rgb(105, 121, 145)
+    private val good = Color.rgb(18, 137, 99)
+    private val warning = Color.rgb(171, 100, 26)
 
     private lateinit var usbManager: UsbManager
     private var usb: DualSenseUsb? = null
@@ -54,7 +57,30 @@ class MainActivity : Activity() {
     private var rangeCount = 0
     private val rangeMin = IntArray(4) { 255 }
     private val rangeMax = IntArray(4)
-    private var lastFrame = 0L
+    // USB reports arrive on a worker thread. Keep only the most recent report for
+    // the next display frame; never queue a runnable for every HID packet.
+    @Volatile private var latestSample: StickSample? = null
+    private val uiFramePending = AtomicBoolean(false)
+    private var lastTelemetryAt = 0L
+    private var lastRangeLabelAt = 0L
+    private val displayFrame = Choreographer.FrameCallback {
+        uiFramePending.set(false)
+        val sample = latestSample
+        if (usb != null && sample != null && !isFinishing && !isDestroyed) {
+            leftPlot.setPosition(sample.lx, sample.ly)
+            rightPlot.setPosition(sample.rx, sample.ry)
+            val now = SystemClock.elapsedRealtime()
+            // Updating text layout every USB report is costly; plots stay frame-synced.
+            if (now - lastTelemetryAt >= 80L) {
+                rawText.text = "LX ${sample.lx}    LY ${sample.ly}    RX ${sample.rx}    RY ${sample.ry}"
+                lastTelemetryAt = now
+            }
+            if (session == Session.RANGE && now - lastRangeLabelAt >= 400L) {
+                showInstruction()
+                lastRangeLabelAt = now
+            }
+        }
+    }
     @Volatile private var connectionEpoch = 0
 
     private lateinit var statusText: TextView
@@ -113,8 +139,10 @@ class MainActivity : Activity() {
     }
 
     private fun dp(value: Int) = (resources.displayMetrics.density * value + 0.5f).toInt()
-    private fun shape(color: Int, radius: Int = 16) = GradientDrawable().apply {
-        setColor(color); cornerRadius = dp(radius).toFloat()
+    private fun shape(color: Int, radius: Int = 16, bordered: Boolean = false) = GradientDrawable().apply {
+        setColor(color)
+        cornerRadius = dp(radius).toFloat()
+        if (bordered) setStroke(dp(1), Color.rgb(225, 232, 243))
     }
     private fun label(text: String, size: Float = 14f, color: Int = muted, bold: Boolean = false) =
         TextView(this).apply {
@@ -128,23 +156,28 @@ class MainActivity : Activity() {
     }
     private fun section(parent: LinearLayout, title: String, subtitle: String = ""): LinearLayout {
         val box = vertical()
-        box.background = shape(surface)
-        box.setPadding(dp(18), dp(18), dp(18), dp(18))
-        box.addView(label(title, 18f, ink, true))
+        box.background = shape(surface, 17, bordered = true)
+        box.setPadding(dp(16), dp(16), dp(16), dp(16))
+        box.addView(label(title, 17f, ink, true))
         if (subtitle.isNotEmpty()) {
             val l = label(subtitle, 12f, muted)
-            l.setPadding(0, dp(5), 0, dp(12))
+            l.setPadding(0, dp(6), 0, dp(13))
             box.addView(l)
-        } else box.setPadding(dp(18), dp(18), dp(18), dp(18))
-        parent.addView(box, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(14) })
+        }
+        parent.addView(box, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(12) })
         return box
     }
     private fun action(text: String, onClick: () -> Unit): Button = Button(this).apply {
         this.text = text
         isAllCaps = false
-        textSize = 13f
+        textSize = 14f
+        setTypeface(null, Typeface.BOLD)
         setTextColor(Color.WHITE)
-        background = shape(accent, 12)
+        background = shape(Color.WHITE, 10)
+        backgroundTintList = ColorStateList(
+            arrayOf(intArrayOf(-android.R.attr.state_enabled), intArrayOf()),
+            intArrayOf(Color.rgb(174, 187, 205), accent)
+        )
         minimumHeight = dp(48)
         setOnClickListener { onClick() }
         val p = LinearLayout.LayoutParams(-1, dp(50))
@@ -157,59 +190,64 @@ class MainActivity : Activity() {
         return v
     }
     private fun buildUi() {
-        val scroll = ScrollView(this).apply { setBackgroundColor(this@MainActivity.background); setFillViewport(true) }
+        val scroll = ScrollView(this).apply {
+            setBackgroundColor(this@MainActivity.background)
+            setFillViewport(true)
+            isVerticalScrollBarEnabled = false
+        }
         val root = vertical()
-        root.setPadding(dp(18), dp(28), dp(18), dp(32))
+        root.setPadding(dp(16), dp(21), dp(16), dp(32))
         scroll.addView(root)
         setContentView(scroll)
-        root.addView(label("DRIFT LAB  /  ANDROID", 12f, accent, true))
-        root.addView(label("DualSense Calibration", 27f, ink, true).apply {
-            setPadding(0, dp(5), 0, dp(6))
+        root.addView(label("DUALSENSE  /  ANDROID", 11f, accent, true))
+        root.addView(label("Drift Calibration", 29f, ink, true).apply {
+            setPadding(0, dp(4), 0, dp(4))
         })
-        root.addView(label("Native USB connection · No browser required", 13f).apply {
-            setPadding(0, 0, 0, dp(20))
+        root.addView(label("Native USB calibration & live joystick diagnostics", 13f).apply {
+            setPadding(0, 0, 0, dp(18))
         })
 
-        val device = section(root, "01  Controller", "Standard DualSense • USB-C data cable / OTG")
+        val device = section(root, "Controller Info", "DualSense (054C:0CE6)  •  Wired USB-C connection")
         statusText = textInfo(device, "Not connected")
         memoryText = label("Memory status: —", 12f, muted).also {
             it.setPadding(0, dp(8), 0, 0); device.addView(it)
         }
         connectButton = action("Connect DualSense") { connectOrDisconnect() }.also { device.addView(it) }
 
-        val live = section(root, "02  Live stick monitor", "Real controller input, no simulated values")
+        val live = section(root, "Joystick Info", "Responsive live input — synchronized with your display")
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
         val lcol = vertical().apply { gravity = Gravity.CENTER }
         val rcol = vertical().apply { gravity = Gravity.CENTER }
         leftPlot = StickPlotView(this); rightPlot = StickPlotView(this)
-        lcol.addView(label("LEFT STICK", 11f, ink, true))
+        lcol.addView(label("LEFT STICK", 11f, muted, true).apply { gravity = Gravity.CENTER })
         lcol.addView(leftPlot)
-        rcol.addView(label("RIGHT STICK", 11f, ink, true))
+        rcol.addView(label("RIGHT STICK", 11f, muted, true).apply { gravity = Gravity.CENTER })
         rcol.addView(rightPlot)
         row.addView(lcol, LinearLayout.LayoutParams(0, -2, 1f))
         row.addView(rcol, LinearLayout.LayoutParams(0, -2, 1f))
         live.addView(row)
-        rawText = label("LX: —   LY: —    RX: —   RY: —", 12f, muted)
+        rawText = label("LX —    LY —    RX —    RY —", 12f, muted, true)
         rawText.gravity = Gravity.CENTER
+        rawText.setPadding(0, dp(10), 0, dp(4))
         live.addView(rawText)
 
-        val drift = section(root, "03  Drift diagnosis", "Leave both sticks untouched on a flat surface for 3.5 seconds")
+        val drift = section(root, "Quick Test / Drift Diagnosis", "Release both sticks for 3.5 seconds to measure resting offset")
         resultText = textInfo(drift, "Run a drift test to establish a baseline before calibrating.")
         testButton = action("Run drift test") { driftTest() }.also { drift.addView(it) }
 
-        val cal = section(root, "04  Calibration", "Experimental hardware writes. Never unplug during a calibration step.")
+        val cal = section(root, "Stick Calibration", "Guided center and range calibration · Do not unplug during a step")
         instructionText = textInfo(cal, "Start with a stable baseline test. Calibrate only if the sticks are mechanically sound.")
         centerButton = action("Guided center calibration") { centerClick() }.also { cal.addView(it) }
         rangeButton = action("Range calibration") { rangeClick() }.also { cal.addView(it) }
 
-        val save = section(root, "05  Permanent memory save", "Disabled until calibration and a verified after-test are complete")
+        val save = section(root, "Save Changes Permanently", "Requires valid calibration and a stable post-calibration test")
         save.addView(label("Saving changes to NVS is potentially irreversible and can damage calibration. Test the result first.", 13f, warning))
         saveButton = action("Save permanently") { confirmSave() }.also { save.addView(it) }
 
-        val events = section(root, "Diagnostics", "Local-only. No accounts, network access or analytics")
+        val events = section(root, "Diagnostic Log", "Local-only · No account or network required")
         logText = label("Connect a controller to begin.", 12f, muted)
         events.addView(logText)
-        root.addView(label("UNOFFICIAL • Not affiliated with Sony. Calibration cannot repair worn hardware.", 11f).apply {
+        root.addView(label("UNOFFICIAL · NOT AFFILIATED WITH SONY. Recalibration cannot repair physically worn sticks.", 11f).apply {
             setPadding(0, dp(8), 0, 0)
         })
     }
@@ -249,6 +287,9 @@ class MainActivity : Activity() {
             connectionEpoch++
             usb = bridge
             synchronized(samplesLock) { samples.clear() }
+            latestSample = null
+            leftPlot.reset(); rightPlot.reset()
+            rawText.text = "LX —    LY —    RX —    RY —"
             session = Session.NONE; dirty = false; memory = null
             baseline = null; afterResult = null; centerStep = 0
             bridge.startInput()
@@ -266,6 +307,9 @@ class MainActivity : Activity() {
         session = Session.NONE; memory = null; dirty = false
         baseline = null; afterResult = null
         synchronized(samplesLock) { samples.clear() }
+        latestSample = null
+        leftPlot.reset(); rightPlot.reset()
+        rawText.text = "LX —    LY —    RX —    RY —"
         note(message); updateUi()
     }
 
@@ -282,14 +326,17 @@ class MainActivity : Activity() {
                 rangeCount++
             }
         }
-        if (sample.timestamp - lastFrame < 100) return
-        lastFrame = sample.timestamp
-        runOnUiThread {
-            if (usb == null) return@runOnUiThread
-            leftPlot.setPosition(sample.lx, sample.ly)
-            rightPlot.setPosition(sample.rx, sample.ry)
-            rawText.text = "LX ${sample.lx}  LY ${sample.ly}     RX ${sample.rx}  RY ${sample.ry}"
-            if (session == Session.RANGE) showInstruction()
+        // The USB reader never waits for a UI redraw and never queues more than
+        // one display callback. Frames use the newest available real sample.
+        latestSample = sample
+        if (uiFramePending.compareAndSet(false, true)) {
+            runOnUiThread {
+                if (usb != null && !isFinishing && !isDestroyed) {
+                    Choreographer.getInstance().postFrameCallback(displayFrame)
+                } else {
+                    uiFramePending.set(false)
+                }
+            }
         }
     }
 
