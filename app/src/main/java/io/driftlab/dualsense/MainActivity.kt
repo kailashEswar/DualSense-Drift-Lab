@@ -157,7 +157,7 @@ class MainActivity : Activity() {
         return v
     }
     private fun buildUi() {
-        val scroll = ScrollView(this).apply { setBackgroundColor(background); fillViewport = true }
+        val scroll = ScrollView(this).apply { setBackgroundColor(this@MainActivity.background); setFillViewport(true) }
         val root = vertical()
         root.setPadding(dp(18), dp(28), dp(18), dp(32))
         scroll.addView(root)
