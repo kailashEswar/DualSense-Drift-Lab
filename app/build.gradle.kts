@@ -10,8 +10,8 @@ android {
         applicationId = "io.driftlab.dualsense"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "0.2.0-alpha"
+        versionCode = 3
+        versionName = "0.3.0-alpha"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17

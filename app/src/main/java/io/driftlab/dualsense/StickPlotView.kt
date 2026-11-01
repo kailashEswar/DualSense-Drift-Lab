@@ -41,6 +41,14 @@ class StickPlotView(context: Context) : View(context) {
     private val highlight = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
     private val history = ArrayDeque<Pair<Int, Int>>()
 
+    private var zoomEnabled = false
+
+    fun setZoomEnabled(enabled: Boolean) {
+        if (zoomEnabled == enabled) return
+        zoomEnabled = enabled
+        postInvalidateOnAnimation()
+    }
+
     var x: Int = 128
         private set
     var y: Int = 128
@@ -86,15 +94,24 @@ class StickPlotView(context: Context) : View(context) {
         canvas.drawLine(cx - radius, cy, cx + radius, cy, cross)
         canvas.drawLine(cx, cy - radius, cx, cy + radius, cross)
         canvas.drawCircle(cx, cy, radius * 0.12f, centerRing)
+        if (zoomEnabled) canvas.drawCircle(cx, cy, radius * 0.5f, centerRing)
 
-        fun axisX(raw: Int) = cx + ((raw - 127.5f) / 127.5f) * radius
-        fun axisY(raw: Int) = cy + ((raw - 127.5f) / 127.5f) * radius
+        fun position(rawX: Int, rawY: Int): Pair<Float, Float> {
+            val xx = PrecisionCalibration.normalized(rawX)
+            val yy = PrecisionCalibration.normalized(rawY)
+            val (displayX, displayY) = if (zoomEnabled) PrecisionCalibration.zoom(xx, yy) else xx to yy
+            return (cx + displayX * radius) to (cy + displayY * radius)
+        }
         history.forEachIndexed { index, position ->
             trailPaint.alpha = 35 + index * 24
-            canvas.drawCircle(axisX(position.first), axisY(position.second), 2.1f * density, trailPaint)
+            val (hx, hy) = position(position.first, position.second)
+            canvas.drawCircle(hx, hy, 2.1f * density, trailPaint)
         }
-        val px = axisX(x)
-        val py = axisY(y)
+        val (px, py) = position(x, y)
+        if (zoomEnabled) {
+            // The inner half of the dial represents only the closest 5% of stick travel.
+            canvas.drawLine(cx, cy, px, py, cross)
+        }
         canvas.drawCircle(px, py, 13f * density, halo)
         canvas.drawCircle(px, py, 6.5f * density, dot)
         canvas.drawCircle(px - density, py - density, 1.65f * density, highlight)

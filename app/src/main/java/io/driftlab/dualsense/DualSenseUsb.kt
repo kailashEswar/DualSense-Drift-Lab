@@ -172,6 +172,55 @@ class DualSenseUsb(
         return bytes.copyOf(count)
     }
 
+    /**
+     * Read the 12 live calibration parameters, following the original DualShock Tools
+     * getInMemoryModuleData() feature report sequence (0x80: 0C 02 -> 0x81).
+     * This does not change calibration values or non-volatile storage.
+     */
+    fun readFinetuneData(): IntArray = synchronized(reportLock) {
+        check(!closing) { "Controller disconnected." }
+        check(memoryStatus() == MemoryState.LOCKED) { "NVS must be confirmed locked before finetuning." }
+        setFeature(0x80, intArrayOf(12, 2))
+        Thread.sleep(100)
+        val reply = getFeature(0x81)
+        check(reply.size >= 28) { "Incomplete finetune data (got ${reply.size} bytes)." }
+        val code = reply[1].toInt() and 255
+        val operation = reply[2].toInt() and 255
+        val status = reply[3].toInt() and 255
+        check(code == 12 && (operation == 2 || operation == 4) && status == 2) {
+            "Unexpected finetune response: $code/$operation/$status. No values will be written."
+        }
+        IntArray(PrecisionCalibration.FIELD_COUNT) { i ->
+            val lo = reply[4 + 2 * i].toInt() and 255
+            val hi = reply[5 + 2 * i].toInt() and 255
+            lo or (hi shl 8)
+        }
+    }
+
+    /**
+     * Write working RAM calibration only (NOT a persistent NVS save), then verify
+     * by re-reading all 12 values. Never auto-retry a failed write.
+     */
+    fun writeFinetuneData(data: IntArray) = synchronized(reportLock) {
+        check(!closing) { "Controller disconnected." }
+        require(data.size == PrecisionCalibration.FIELD_COUNT && data.all { it in 0..65535 }) {
+            "Invalid 12-field calibration payload."
+        }
+        check(memoryStatus() == MemoryState.LOCKED) { "Calibration memory not locked." }
+        val payload = IntArray(2 + data.size * 2)
+        payload[0] = 12
+        payload[1] = 1
+        data.forEachIndexed { i, v ->
+            payload[2 + i * 2] = v and 255
+            payload[3 + i * 2] = (v ushr 8) and 255
+        }
+        setFeature(0x80, payload)
+        Thread.sleep(100)
+        check(readFinetuneData().contentEquals(data)) {
+            "Controller did not confirm new RAM calibration. Power-cycle before any further writes."
+        }
+    }
+
     enum class MemoryState { LOCKED, UNLOCKED, PENDING_REBOOT, UNKNOWN }
 
     /** Read-only in the sense of calibration memory, but sends a USB status request. */
