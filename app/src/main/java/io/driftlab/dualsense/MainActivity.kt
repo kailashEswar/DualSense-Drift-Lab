@@ -71,15 +71,15 @@ class MainActivity : Activity() {
         if (usb != null && sample != null && !isFinishing && !isDestroyed) {
             leftPlot.setPosition(sample.lx, sample.ly)
             rightPlot.setPosition(sample.rx, sample.ry)
-            finePlot?.setPosition(if (fineStick == 0) sample.lx else sample.rx,
-                if (fineStick == 0) sample.ly else sample.ry)
+            fineInputHandler?.invoke(sample)
+            // Both plots render authentic USB coordinates independently.
+            finePlot?.setPosition(sample.lx, sample.ly)
+            fineOtherPlot?.setPosition(sample.rx, sample.ry)
             val now = SystemClock.elapsedRealtime()
             // Updating text layout every USB report is costly; plots stay frame-synced.
             if (now - lastTelemetryAt >= 80L) {
                 rawText.text = "LX ${sample.lx}    LY ${sample.ly}    RX ${sample.rx}    RY ${sample.ry}"
-                fineLiveText?.text = if (fineStick == 0)
-                    "Live X ${sample.lx} · Y ${sample.ly} (8-bit USB reports)"
-                else "Live X ${sample.rx} · Y ${sample.ry} (8-bit USB reports)"
+                fineLiveText?.text = "LEFT ${sample.lx}, ${sample.ly}     RIGHT ${sample.rx}, ${sample.ry}  (USB)"
                 lastTelemetryAt = now
             }
             if (session == Session.RANGE && now - lastRangeLabelAt >= 400L) {
@@ -103,6 +103,9 @@ class MainActivity : Activity() {
     private lateinit var saveButton: Button
     private lateinit var finetuneButton: Button
     private var finePlot: StickPlotView? = null
+    private var fineOtherPlot: StickPlotView? = null
+    private var fineInputHandler: ((StickSample) -> Unit)? = null
+    private var fineDialog: AlertDialog? = null
     private var fineLiveText: TextView? = null
     private var fineStick = 0
     private var zoomEnabled = false
@@ -343,7 +346,9 @@ class MainActivity : Activity() {
         synchronized(samplesLock) { samples.clear() }
         latestSample = null
         leftPlot.reset(); rightPlot.reset()
+        fineDialog?.dismiss()
         finePlot?.reset()
+        fineOtherPlot?.reset()
         rawText.text = "LX —    LY —    RX —    RY —"
         note(message); updateUi()
     }
@@ -417,9 +422,9 @@ class MainActivity : Activity() {
     }
 
     /**
-     * A guarded version of the original project's fine-tune dialog. The native app
-     * offers explicit, small adjustments and only sends the complete 12-field block
-     * after user confirmation. The persistent NVS save stays a separate action.
+     * Original-style, controller-driven RAM fine-tuning. D-pad and face buttons
+     * are decoded from real USB 0x01 reports. The display shows *real* HID axis
+     * positions after each verified RAM update, never simulated movement.
      */
     private fun openFinetune() {
         val bridge = usb ?: return
@@ -436,17 +441,37 @@ class MainActivity : Activity() {
     }
 
     private fun showFinetuneDialog(bridge: DualSenseUsb, original: IntArray) {
-        var working = original.copyOf()
-        var stepSize = 1
+        val previouslyModified = dirty
+        var desired = original.copyOf()
+        var confirmed = original.copyOf()
+        var stepSize = 5
         var circularity = false
+        var liveEnabled = false
+        var writing = false
+        var faulted = false
+        var closingRestore = false
+        var closingKeep = false
+        var lastFrame: StickSample? = null
+        var lastDirection: FineTuneControls.Direction? = null
+        var highlightField = -1
+        var nextRepeatAt = 0L
+        var priorL1 = false
+        var priorR1 = false
+        val epoch = connectionEpoch
         fineStick = 0
 
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(8), dp(18), dp(12))
+            setPadding(dp(16), dp(8), dp(16), dp(12))
         }
-        val scroll = ScrollView(this).apply { addView(layout) }
-        layout.addView(label("Changes are staged locally until Apply. Release the sticks before changing center values.", 13f, warning))
+        val scroll = ScrollView(this).apply {
+            addView(layout)
+            isVerticalScrollBarEnabled = false
+        }
+        layout.addView(label("Controller controls: L1 = Center, R1 = Circularity. Move a stick to select it. D-pad or □/○/△/✕ adjusts in that direction. Hold for repeated fine steps.", 13f, ink))
+        layout.addView(label("Live tuning sends each adjustment to controller RAM (not permanent storage). Keep USB connected and charged.", 12f, warning).apply {
+            setPadding(0, dp(7), 0, dp(8))
+        })
 
         val stickChoice = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
         val left = RadioButton(this).apply { text = "Left stick"; id = View.generateViewId(); isChecked = true }
@@ -455,145 +480,333 @@ class MainActivity : Activity() {
         layout.addView(stickChoice)
 
         val modeChoice = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
-        val centerMode = RadioButton(this).apply { text = "Center"; id = View.generateViewId(); isChecked = true }
-        val rangeMode = RadioButton(this).apply { text = "Circularity"; id = View.generateViewId() }
+        val centerMode = RadioButton(this).apply { text = "Center (L1)"; id = View.generateViewId(); isChecked = true }
+        val rangeMode = RadioButton(this).apply { text = "Circularity (R1)"; id = View.generateViewId() }
         modeChoice.addView(centerMode); modeChoice.addView(rangeMode)
         layout.addView(modeChoice)
 
-        val zoomSwitch = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
-        val normal = RadioButton(this).apply { text = "Normal"; id = View.generateViewId() }
-        val zoom = RadioButton(this).apply { text = "10x zoom"; id = View.generateViewId(); isChecked = true }
-        zoomSwitch.addView(normal); zoomSwitch.addView(zoom)
-        layout.addView(zoomSwitch)
-        val plotContainer = LinearLayout(this).apply { gravity = Gravity.CENTER_HORIZONTAL }
-        val plot = StickPlotView(this).apply { setZoomEnabled(true) }
-        finePlot = plot
-        latestSample?.let { plot.setPosition(it.lx, it.ly) }
-        plotContainer.addView(plot)
+        val zoomChoice = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
+        val normalZoom = RadioButton(this).apply { text = "Normal"; id = View.generateViewId() }
+        val tenZoom = RadioButton(this).apply { text = "10x zoom"; id = View.generateViewId(); isChecked = true }
+        zoomChoice.addView(normalZoom); zoomChoice.addView(tenZoom)
+        layout.addView(zoomChoice)
+
+        // Like the original calibration interface: show both sticks at once.
+        val plotContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+        val leftColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+        val rightColumn = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+        val leftCaption = label("● LEFT (ACTIVE)", 11f, accent, true).apply { gravity = Gravity.CENTER }
+        val rightCaption = label("RIGHT STICK", 11f, muted, true).apply { gravity = Gravity.CENTER }
+        val leftFinePlot = StickPlotView(this).apply { setZoomEnabled(true) }
+        val rightFinePlot = StickPlotView(this).apply { setZoomEnabled(true) }
+        finePlot = leftFinePlot
+        fineOtherPlot = rightFinePlot
+        leftColumn.addView(leftCaption)
+        leftColumn.addView(leftFinePlot)
+        rightColumn.addView(rightCaption)
+        rightColumn.addView(rightFinePlot)
+        plotContainer.addView(leftColumn, LinearLayout.LayoutParams(0, -2, 1f))
+        plotContainer.addView(rightColumn, LinearLayout.LayoutParams(0, -2, 1f))
+        latestSample?.let {
+            leftFinePlot.setPosition(it.lx, it.ly)
+            rightFinePlot.setPosition(it.rx, it.ry)
+        }
         layout.addView(plotContainer)
-        fineLiveText = label("Raw joystick coordinates (USB input)", 12f, muted)
-        fineLiveText?.gravity = Gravity.CENTER
+        fineLiveText = label("Live USB stick coordinates", 12f, muted).apply {
+            gravity = Gravity.CENTER
+        }
         layout.addView(fineLiveText)
-        layout.addView(label("Step size (raw 16-bit calibration units)", 12f, muted).apply {
-            setPadding(0, dp(12), 0, 0)
+        layout.addView(label("Adjustment step (16-bit units)", 12f, muted).apply {
+            setPadding(0, dp(10), 0, 0)
         })
         val stepChoice = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
-        for (number in intArrayOf(1, 5, 10, 15)) {
-            val button = RadioButton(this).apply {
-                text = number.toString()
+        for (n in intArrayOf(1, 5, 10, 15)) {
+            stepChoice.addView(RadioButton(this).apply {
+                text = n.toString()
                 id = View.generateViewId()
-                isChecked = number == 1
-                setOnClickListener { stepSize = number }
-            }
-            stepChoice.addView(button)
+                isChecked = n == 5
+                setOnClickListener { stepSize = n }
+            })
         }
         layout.addView(stepChoice)
 
-        val fieldsBox = vertical()
-        layout.addView(fieldsBox)
-        val stageStatus = label("No changes staged.", 12f, muted)
-        stageStatus.setPadding(0, dp(10), 0, dp(8))
-        layout.addView(stageStatus)
-        val reset = Button(this).apply { text = "Reset staged adjustments"; isAllCaps = false }
+        val controlsStatus = label("Preview only. Enable live tuning to send real-time RAM adjustments.", 12f, warning).apply {
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        layout.addView(controlsStatus)
+        val enableButton = action("Enable live controller tuning") { }.also { layout.addView(it) }
+        val values = vertical()
+        layout.addView(values)
+        val reset = Button(this).apply { text = "Restore original RAM calibration"; isAllCaps = false }
         layout.addView(reset)
 
-        fun renderFields() {
-            fieldsBox.removeAllViews()
-            val fields = PrecisionCalibration.fields(fineStick, circularity)
-            val changed = working.indices.count { working[it] != original[it] }
-            stageStatus.text = if (changed == 0) "No changes staged — nothing written to controller."
-                else "$changed calibration field(s) modified. Not yet sent to controller."
-            fields.forEach { index ->
-                val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-                row.addView(label(PrecisionCalibration.names[index], 14f, ink, true),
+        fun available() = usb === bridge && epoch == connectionEpoch &&
+            session == Session.NONE && !faulted && !closingKeep && !closingRestore &&
+            memory == DualSenseUsb.MemoryState.LOCKED
+
+        lateinit var updateFields: () -> Unit
+        lateinit var applyQueued: () -> Unit
+        lateinit var change: (Int, Int) -> Unit
+        lateinit var closeDialog: () -> Unit
+
+        closeDialog = { fineDialog?.dismiss() }
+
+        updateFields = {
+            values.removeAllViews()
+            val active = PrecisionCalibration.fields(fineStick, circularity)
+            active.forEach { field ->
+                val row = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                }
+                row.addView(label(PrecisionCalibration.names[field], 14f, if (field == highlightField) accent else ink, true),
                     LinearLayout.LayoutParams(0, -2, 0.75f))
-                val decrease = Button(this).apply { text = "−"; isAllCaps = false }
-                row.addView(decrease, LinearLayout.LayoutParams(0, dp(46), 0.75f))
-                val number = label(working[index].toString(), 13f, ink, true).apply { gravity = Gravity.CENTER }
-                row.addView(number, LinearLayout.LayoutParams(0, -2, 1.2f))
-                val increase = Button(this).apply { text = "+"; isAllCaps = false }
-                row.addView(increase, LinearLayout.LayoutParams(0, dp(46), 0.75f))
-                fieldsBox.addView(row)
-                fun change(delta: Int) {
-                    // Center tuning must be done with the stick released.
-                    if (!circularity) {
-                        val latest = latestSample
-                        val x = if (fineStick == 0) latest?.lx else latest?.rx
-                        val y = if (fineStick == 0) latest?.ly else latest?.ry
-                        if (x == null || y == null || kotlin.math.abs(x - 128) > 35 || kotlin.math.abs(y - 128) > 35) {
-                            stageStatus.text = "Release the selected stick near center before changing center values."
-                            return
+                val minus = Button(this).apply { text = "−"; isAllCaps = false }
+                row.addView(minus, LinearLayout.LayoutParams(0, dp(45), 0.7f))
+                row.addView(label(desired[field].toString(), 13f, ink, true).apply { gravity = Gravity.CENTER },
+                    LinearLayout.LayoutParams(0, -2, 1.2f))
+                val plus = Button(this).apply { text = "+"; isAllCaps = false }
+                row.addView(plus, LinearLayout.LayoutParams(0, dp(45), 0.7f))
+                minus.setOnClickListener { change(field, -stepSize) }
+                plus.setOnClickListener { change(field, stepSize) }
+            }
+        }
+
+        applyQueued = fun() {
+            if (writing || faulted || usb !== bridge || epoch != connectionEpoch) return
+            if (!desired.contentEquals(confirmed)) {
+                if (!liveEnabled && !closingRestore && !closingKeep) return
+                val payload = desired.copyOf()
+                writing = true
+                controlsStatus.text = "Applying calibration to RAM… controller readback in progress."
+                executor.execute {
+                    var error: Exception? = null
+                    try { bridge.writeFinetuneData(payload) }
+                    catch (e: Exception) { error = e }
+                    runOnUiThread {
+                        writing = false
+                        if (usb !== bridge || epoch != connectionEpoch || fineDialog == null) return@runOnUiThread
+                        if (error != null) {
+                            faulted = true
+                            liveEnabled = false
+                            session = Session.FAULT
+                            controlsStatus.text = "USB calibration write/verification failed: ${error?.message}. Power-cycle the controller before another attempt."
+                            enableButton.isEnabled = false
+                            note("Fine tuning stopped: ${error?.message}")
+                            updateUi()
+                            return@runOnUiThread
+                        }
+                        confirmed = payload
+                        dirty = previouslyModified || !confirmed.contentEquals(original)
+                        afterResult = null
+                        if (closingRestore && confirmed.contentEquals(original)) {
+                            note("Original RAM calibration restored and verified.")
+                            updateUi()
+                            closeDialog()
+                        } else if (closingKeep && confirmed.contentEquals(desired)) {
+                            note("Fine tuning applied to RAM. Run a new drift test before any permanent save.")
+                            updateUi()
+                            closeDialog()
+                        } else {
+                            controlsStatus.text = if (desired.contentEquals(confirmed))
+                                "RAM verified • ${desired.indices.count { desired[it] != original[it] }} adjusted field(s). Live USB plot is showing controller output."
+                            else "More adjustments queued…"
+                            updateUi()
+                            applyQueued()
                         }
                     }
-                    try {
-                        working = PrecisionCalibration.adjust(original, working, index, delta)
-                        renderFields()
-                    } catch (e: IllegalArgumentException) { stageStatus.text = e.message ?: "Adjustment rejected" }
                 }
-                decrease.setOnClickListener { change(-stepSize) }
-                increase.setOnClickListener { change(stepSize) }
+            } else if (closingRestore || closingKeep) {
+                updateUi()
+                closeDialog()
             }
         }
-        stickChoice.setOnCheckedChangeListener { _, checkedId ->
-            fineStick = if (checkedId == left.id) 0 else 1
-            latestSample?.let {
-                plot.setPosition(if (fineStick == 0) it.lx else it.rx, if (fineStick == 0) it.ly else it.ry)
+
+        change = fun(field: Int, delta: Int) {
+            if (!available() || !liveEnabled) {
+                controlsStatus.text = if (faulted) "Write failed: power-cycle required."
+                    else "Enable live tuning before changing controller calibration."
+                return
             }
-            renderFields()
+            val input = latestSample
+            if (input == null || SystemClock.elapsedRealtime() - input.timestamp > 1000L) {
+                controlsStatus.text = "No recent USB input. Check the controller connection."
+                return
+            }
+            // Field-specific guard: center only when released; circularity at an extreme.
+            val normX = PrecisionCalibration.normalized(if (fineStick == 0) input.lx else input.rx)
+            val normY = PrecisionCalibration.normalized(if (fineStick == 0) input.ly else input.ry)
+            if (!circularity && (kotlin.math.abs(normX) > 0.50f || kotlin.math.abs(normY) > 0.50f)) {
+                controlsStatus.text = "Release the selected stick before center adjustment."
+                return
+            }
+            if (circularity && maxOf(kotlin.math.abs(normX), kotlin.math.abs(normY)) < 0.50f) {
+                controlsStatus.text = "Hold the selected stick at an edge for circularity adjustments."
+                return
+            }
+            try {
+                desired = PrecisionCalibration.adjust(original, desired, field, delta)
+                highlightField = field
+                updateFields()
+                controlsStatus.text = "${PrecisionCalibration.names[field]} = ${desired[field]} • queued for RAM verification"
+                applyQueued()
+            } catch (e: IllegalArgumentException) {
+                controlsStatus.text = e.message ?: "Adjustment refused."
+            }
         }
-        modeChoice.setOnCheckedChangeListener { _, checkedId ->
-            circularity = checkedId == rangeMode.id
-            renderFields()
+
+        stickChoice.setOnCheckedChangeListener { _, selected ->
+            fineStick = if (selected == left.id) 0 else 1
+            lastDirection = null
+            leftCaption.text = if (fineStick == 0) "● LEFT (ACTIVE)" else "LEFT STICK"
+            rightCaption.text = if (fineStick == 1) "● RIGHT (ACTIVE)" else "RIGHT STICK"
+            leftCaption.setTextColor(if (fineStick == 0) accent else muted)
+            rightCaption.setTextColor(if (fineStick == 1) accent else muted)
+            updateFields()
         }
-        zoomSwitch.setOnCheckedChangeListener { _, checkedId -> plot.setZoomEnabled(checkedId == zoom.id) }
-        reset.setOnClickListener { working = original.copyOf(); renderFields() }
-        renderFields()
+        modeChoice.setOnCheckedChangeListener { _, selected ->
+            circularity = selected == rangeMode.id
+            lastDirection = null
+            updateFields()
+        }
+        zoomChoice.setOnCheckedChangeListener { _, selected ->
+            leftFinePlot.setZoomEnabled(selected == tenZoom.id)
+            rightFinePlot.setZoomEnabled(selected == tenZoom.id)
+        }
+        updateFields()
 
         val dialog = AlertDialog.Builder(this)
             .setTitle("Precise stick calibration")
             .setView(scroll)
-            .setNegativeButton("Cancel", null)
-            .setPositiveButton("Apply to RAM", null)
+            .setNegativeButton("Cancel / restore", null)
+            .setPositiveButton("Keep RAM changes", null)
             .create()
+        dialog.setCancelable(false)
+        fineDialog = dialog
         dialog.setOnDismissListener {
-            if (finePlot === plot) finePlot = null
+            if (fineDialog === dialog) fineDialog = null
+            fineInputHandler = null
+            finePlot = null
+            fineOtherPlot = null
             fineLiveText = null
         }
-        dialog.setOnShowListener {
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                if (working.contentEquals(original)) {
-                    stageStatus.text = "No changes to apply."
-                    return@setOnClickListener
-                }
-                if (usb !== bridge || session != Session.NONE || operationBusy) {
-                    stageStatus.text = "Connection or calibration state changed; reconnect to retry."
-                    return@setOnClickListener
-                }
-                if (!readyForCalibration()) return@setOnClickListener
-                // Bound each value to a small change from device-provided original.
-                if (working.indices.any { kotlin.math.abs(working[it] - original[it]) > PrecisionCalibration.MAX_SESSION_DELTA }) {
-                    stageStatus.text = "Session safety limit exceeded."
-                    return@setOnClickListener
-                }
-                val payload = working.copyOf()
+
+        enableButton.setOnClickListener {
+            if (!available() || writing) return@setOnClickListener
+            if (liveEnabled) {
+                controlsStatus.text = "Live tuning is already enabled. Use D-pad, face buttons or on-screen +/−."
+                return@setOnClickListener
+            }
+            AlertDialog.Builder(this)
+                .setTitle("Enable live RAM calibration?")
+                .setMessage("Controller buttons will now modify real calibration parameters in RAM. These temporary hardware writes are experimental. Keep the controller charged and connected, and do not leave during a write. A failed write may require a power-cycle. Continue?")
+                .setNegativeButton("Not yet", null)
+                .setPositiveButton("Enable") { _, _ ->
+                    if (!available() || !readyForCalibration()) return@setPositiveButton
+                    liveEnabled = true
+                    enableButton.text = "Live tuning enabled"
+                    enableButton.isEnabled = false
+                    controlsStatus.text = "Ready • Release the stick for Center, hold at a cardinal edge for Circularity."
+                }.show()
+        }
+        reset.setOnClickListener {
+            if (faulted || usb !== bridge || epoch != connectionEpoch) {
+                controlsStatus.text = "Cannot restore on a failed/disconnected session. Power-cycle first."
+            } else {
                 AlertDialog.Builder(this)
-                    .setTitle("Apply fine-tune changes to controller RAM?")
-                    .setMessage("This will send actual calibration values to the DualSense. The change is NOT a permanent save yet. Keep USB connected and charged. A failed write may require a controller power-cycle. Continue?")
-                    .setNegativeButton("Not now", null)
-                    .setPositiveButton("Apply to RAM") { _, _ ->
-                        dialog.dismiss()
-                        // If any write fails, lock the app's write path until power-cycle.
-                        session = Session.FAULT
-                        runCommand("Fine-tune RAM calibration") {
-                            bridge.writeFinetuneData(payload)
-                            dirty = true
-                            afterResult = null
-                            session = Session.NONE
-                        }
+                    .setTitle("Restore original RAM calibration?")
+                    .setMessage("Restore all 12 original values captured when fine tuning opened? This changes only controller RAM, not permanent storage.")
+                    .setNegativeButton("Keep editing", null)
+                    .setPositiveButton("Restore") { _, _ ->
+                        desired = original.copyOf()
+                        updateFields()
+                        closingRestore = true
+                        liveEnabled = false
+                        applyQueued()
+                        controlsStatus.text = "Restoring original RAM values…"
                     }.show()
             }
         }
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener {
+                if (faulted || usb !== bridge || epoch != connectionEpoch) {
+                    // No more hardware commands when the device state is uncertain.
+                    closeDialog()
+                } else {
+                    desired = original.copyOf()
+                    updateFields()
+                    closingRestore = true
+                    liveEnabled = false
+                    controlsStatus.text = "Restoring original RAM values before closing…"
+                    applyQueued()
+                }
+            }
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                if (faulted || !available() || writing) {
+                    controlsStatus.text = "Cannot finish while a write is pending or controller is in a fault state."
+                    return@setOnClickListener
+                }
+                closingKeep = true
+                liveEnabled = false
+                controlsStatus.text = "Verifying final RAM adjustments…"
+                applyQueued()
+                if (confirmed.contentEquals(desired)) closeDialog()
+            }
+        }
         dialog.show()
+
+        // One invocation per newest actual USB sample; no invented input and no
+        // controller callback posted for each raw USB packet.
+        fineInputHandler = fun(input: StickSample) {
+            if (lastFrame === input) return
+            lastFrame = input
+            if (usb !== bridge || epoch != connectionEpoch || faulted || closingKeep || closingRestore) return
+            if (FineTuneControls.l1(input.buttons1) && !priorL1) modeChoice.check(centerMode.id)
+            if (FineTuneControls.r1(input.buttons1) && !priorR1) modeChoice.check(rangeMode.id)
+            priorL1 = FineTuneControls.l1(input.buttons1)
+            priorR1 = FineTuneControls.r1(input.buttons1)
+
+            // Move one stick strongly to select it, matching the original web tool.
+            val selected = FineTuneControls.stickToSelect(input)
+            if (selected != null && fineStick != selected) {
+                stickChoice.check(if (selected == 0) left.id else right.id)
+            }
+            val direction = FineTuneControls.direction(input.buttons0)
+            if (!liveEnabled || !available()) {
+                lastDirection = direction
+                return
+            }
+            val now = SystemClock.elapsedRealtime()
+            if (direction == null) {
+                lastDirection = null
+                return
+            }
+            if (direction != lastDirection) {
+                lastDirection = direction
+                nextRepeatAt = now + 400L
+            } else if (now < nextRepeatAt) {
+                return
+            } else {
+                nextRepeatAt = now + 150L
+            }
+            val adjustment = FineTuneControls.change(input, fineStick, circularity, direction, stepSize)
+            if (adjustment == null) {
+                controlsStatus.text = if (circularity)
+                    "Hold the selected stick straight to an edge; use the corresponding D-pad direction."
+                else "Release the selected stick before adjusting its center."
+                return
+            }
+            change(adjustment.field, adjustment.delta)
+        }
     }
 
     private fun readyForCalibration(): Boolean {

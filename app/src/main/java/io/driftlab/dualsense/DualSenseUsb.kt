@@ -112,13 +112,15 @@ class DualSenseUsb(
                     queued = false
                     val size = buffer.position()
                     buffer.flip()
-                    if (size >= 5 && (buffer.get(0).toInt() and 0xff) == 0x01) {
+                    if (size >= 11 && (buffer.get(0).toInt() and 0xff) == 0x01) {
                         val sample = StickSample(
                             timestamp = SystemClock.elapsedRealtime(),
                             lx = buffer.get(1).toInt() and 0xff,
                             ly = buffer.get(2).toInt() and 0xff,
                             rx = buffer.get(3).toInt() and 0xff,
-                            ry = buffer.get(4).toInt() and 0xff
+                            ry = buffer.get(4).toInt() and 0xff,
+                            buttons0 = buffer.get(8).toInt() and 0xff,
+                            buttons1 = buffer.get(9).toInt() and 0xff
                         )
                         lastInputAt = sample.timestamp
                         onSample(sample)

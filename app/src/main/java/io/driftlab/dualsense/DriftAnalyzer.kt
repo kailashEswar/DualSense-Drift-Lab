@@ -8,7 +8,9 @@ data class StickSample(
     val lx: Int,
     val ly: Int,
     val rx: Int,
-    val ry: Int
+    val ry: Int,
+    val buttons0: Int = 0x08, // 8 = released d-pad hat, upper bits = face buttons
+    val buttons1: Int = 0     // L1 / R1 / trigger and system buttons
 )
 
 data class DriftResult(
